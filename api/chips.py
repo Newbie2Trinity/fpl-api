@@ -1,5 +1,8 @@
+import os
+import sys
 from http.server import BaseHTTPRequestHandler
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from _lib import fetch_fpl_data, XPModel, analyze_chip_windows, read_json_body, send_json, send_cors_preflight
 
 
