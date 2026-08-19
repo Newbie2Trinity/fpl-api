@@ -112,14 +112,25 @@ class XPModel:
 
     def _fixture_points(self, element, position, fixture_multiplier, scoring):
         """Sum of xP components a-h for a single fixture."""
-        availability = element.get("chance_of_playing_next_round")
-        availability = (availability / 100.0) if availability is not None else 1.0
+        chance = element.get("chance_of_playing_next_round")
+
+        # A player flagged injured/suspended/unavailable is ruled out even if
+        # chance_of_playing_next_round hasn't caught up to 0 yet -- the status
+        # field is the more reliable signal for "definitely not playing".
+        if chance is None and element.get("status") in ("i", "s", "u"):
+            chance = 0
+
+        availability = (chance / 100.0) if chance is not None else 1.0
 
         starts_p90 = min(element.get("starts_per_90") or 0.0, 1.0)
         p_60 = availability * starts_p90
         p_any = availability * min(starts_p90 + 0.15, 1.0)
 
-        if starts_p90 == 0 and (element.get("chance_of_playing_next_round") or 0) == 0:
+        if chance == 0:
+            # Ruled out for the next round -- no fractional-minutes floor.
+            # (Previously this only zeroed out when starts_per_90 was also 0,
+            # so an injured regular starter still got a 5%-of-normal projection
+            # instead of true zero, occasionally outscoring a healthy squad-filler.)
             minutes_fraction = 0.0
         else:
             minutes_fraction = max(p_any, 0.05)
