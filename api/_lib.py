@@ -312,8 +312,19 @@ def optimize_squad(players, budget=100.0, locked_ids=None, excluded_ids=None):
     def cp(i):
         return 2 * n + i
 
+    # BENCH_WEIGHT: the starting XI and captain are the only things that
+    # score points, so they're weighted at full value. But with zero weight
+    # on the other 4 squad slots, the solver is indifferent between a fit
+    # player and an injured/suspended one sitting on the bench at the same
+    # price -- nothing tells it a better bench is preferable. This adds a
+    # small tie-breaking weight (kept well under any realistic starting-XI
+    # xP gap) so it fills the bench with the best available players rather
+    # than an arbitrary pick among equally-priced options.
+    BENCH_WEIGHT = 0.001
+
     c_obj = np.zeros(n_vars)
     for i in range(n):
+        c_obj[sq(i)] = -BENCH_WEIGHT * xp[i]
         c_obj[st(i)] = -xp[i]
         c_obj[cp(i)] = -xp[i]
 
@@ -513,8 +524,14 @@ def _optimize_squad_capped_new_players(players, budget, current_squad_ids, max_n
     def cp(i):
         return 2 * n + i
 
+    # See BENCH_WEIGHT comment in optimize_squad -- same tie-break, so an
+    # equally-priced fit player is preferred over an injured/suspended one
+    # for the bench-only squad slots.
+    BENCH_WEIGHT = 0.001
+
     c_obj = np.zeros(n_vars)
     for i in range(n):
+        c_obj[sq(i)] = -BENCH_WEIGHT * xp[i]
         c_obj[st(i)] = -xp[i]
         c_obj[cp(i)] = -xp[i]
 
