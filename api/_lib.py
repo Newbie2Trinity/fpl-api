@@ -267,6 +267,16 @@ REQUIRED_COUNTS = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
 START_MIN = {"GKP": 1, "DEF": 3, "FWD": 1}
 START_MAX = {"GKP": 1, "DEF": 5, "FWD": 3}
 
+# The starting XI and captain are the only things that score points, so
+# they're weighted at full value in every MILP below. But with zero weight
+# on the other 4 squad-only (bench) slots, the solver is indifferent
+# between a fit player and an injured/suspended one at the same price --
+# nothing tells it a better bench is preferable, and nothing tells the
+# transfer optimizer that swapping a bench player is worth anything either.
+# This tie-break weight is kept well under any realistic starting-XI xP
+# gap so it only ever settles ties, never overrides a real selection call.
+BENCH_WEIGHT = 0.001
+
 
 def _normalize_player_ids(players):
     """XPModel.project_gameweek/project_horizon key each player by
@@ -311,16 +321,6 @@ def optimize_squad(players, budget=100.0, locked_ids=None, excluded_ids=None):
 
     def cp(i):
         return 2 * n + i
-
-    # BENCH_WEIGHT: the starting XI and captain are the only things that
-    # score points, so they're weighted at full value. But with zero weight
-    # on the other 4 squad slots, the solver is indifferent between a fit
-    # player and an injured/suspended one sitting on the bench at the same
-    # price -- nothing tells it a better bench is preferable. This adds a
-    # small tie-breaking weight (kept well under any realistic starting-XI
-    # xP gap) so it fills the bench with the best available players rather
-    # than an arbitrary pick among equally-priced options.
-    BENCH_WEIGHT = 0.001
 
     c_obj = np.zeros(n_vars)
     for i in range(n):
@@ -478,8 +478,17 @@ def optimize_transfers(players, current_squad_ids, bank=0.0, free_transfers=1, m
         hit = max(0, k - free_transfers) * 4
         net = result["total_xp"] - hit
 
-        if net > best_net:
-            best_net = net
+        # total_xp only counts the starting XI + captain, so a transfer that
+        # purely swaps out a bench player (e.g. replacing an injured 0-xP
+        # squad filler with a fit one) always shows net == the k=0 baseline's
+        # net exactly -- there was nothing here to ever recommend that swap.
+        # Add the same small bench tie-break used when building the squad so
+        # a real, if minor, bench upgrade can actually surface as a pick.
+        bench_xp = sum(p["xp"] for p in result["squad"]) - sum(p["xp"] for p in result["starting_xi"])
+        compare_net = net + BENCH_WEIGHT * bench_xp
+
+        if compare_net > best_net:
+            best_net = compare_net
             new_squad_ids = {p["id"] for p in result["squad"]}
             transfers_out = [p for p in current_players if p["id"] not in new_squad_ids]
             transfers_in = [p for p in result["squad"] if p["id"] not in current_squad_ids]
@@ -523,11 +532,6 @@ def _optimize_squad_capped_new_players(players, budget, current_squad_ids, max_n
 
     def cp(i):
         return 2 * n + i
-
-    # See BENCH_WEIGHT comment in optimize_squad -- same tie-break, so an
-    # equally-priced fit player is preferred over an injured/suspended one
-    # for the bench-only squad slots.
-    BENCH_WEIGHT = 0.001
 
     c_obj = np.zeros(n_vars)
     for i in range(n):
