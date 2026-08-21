@@ -22,6 +22,21 @@ POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
 DC_THRESHOLD = {"DEF": 10, "MID": 12, "FWD": 12}  # N/A for GKP
 
+# Best-effort recovery-time estimates (in gameweeks) used to ramp an
+# injured/suspended player's projection back up across a multi-gameweek
+# horizon -- see XPModel._estimated_weeks_out(). FPL's API gives no return
+# date, so this is a coarse keyword read of the free-text `news` field, not
+# a medical prediction. Kept deliberately conservative (short) as the
+# fallback so an unclassified knock doesn't get treated as a long absence.
+LONG_TERM_NEWS_KEYWORDS = (
+    "cruciate", "acl", "achilles", "fracture", "broken", "ruptured",
+    "rupture", "long-term", "long term", "surgery", "months", "ineligible",
+)
+SHORT_TERM_NEWS_KEYWORDS = (
+    "knock", "illness", "virus", "flu", "toe", "rest", "precaution", "minor",
+)
+ROTATION_RISK_STARTS_P90 = 0.5  # below this, flag as a fringe starter
+
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -110,24 +125,17 @@ class XPModel:
                 out.append((f, False))
         return out
 
-    def _fixture_points(self, element, position, fixture_multiplier, scoring):
-        """Sum of xP components a-h for a single fixture."""
-        chance = element.get("chance_of_playing_next_round")
-
-        # A player flagged injured/suspended/unavailable is ruled out even if
-        # chance_of_playing_next_round hasn't caught up to 0 yet -- the status
-        # field is the more reliable signal for "definitely not playing".
-        if chance is None and element.get("status") in ("i", "s", "u"):
-            chance = 0
-
-        availability = (chance / 100.0) if chance is not None else 1.0
-
+    def _fixture_points(self, element, position, fixture_multiplier, scoring, availability):
+        """Sum of xP components a-h for a single fixture. `availability` is
+        this player's probability-of-playing multiplier for the gameweek in
+        question -- see _availability() for how it's derived (including the
+        horizon recovery ramp for players currently ruled out)."""
         starts_p90 = min(element.get("starts_per_90") or 0.0, 1.0)
         p_60 = availability * starts_p90
         p_any = availability * min(starts_p90 + 0.15, 1.0)
 
-        if chance == 0:
-            # Ruled out for the next round -- no fractional-minutes floor.
+        if availability <= 0:
+            # Ruled out -- no fractional-minutes floor.
             # (Previously this only zeroed out when starts_per_90 was also 0,
             # so an injured regular starter still got a 5%-of-normal projection
             # instead of true zero, occasionally outscoring a healthy squad-filler.)
@@ -181,8 +189,92 @@ class XPModel:
 
         return points
 
-    def _player_gw_xp(self, element, gw):
-        """Return (xp, n_fixtures) for this player in this single gameweek."""
+    def _estimated_weeks_out(self, element):
+        """Coarse estimate of how many gameweeks an unavailable player is
+        likely to miss, used only to shape the horizon recovery ramp in
+        _availability(). Not a medical prediction -- see the module-level
+        keyword lists for the reasoning."""
+        status = element.get("status")
+        if status == "u":
+            return 99  # left the club / deregistered -- not returning this season
+        if status == "s":
+            return 2  # most single/short bans clear inside a couple of gameweeks
+
+        news = (element.get("news") or "").lower()
+        if any(k in news for k in LONG_TERM_NEWS_KEYWORDS):
+            return 10
+        if any(k in news for k in SHORT_TERM_NEWS_KEYWORDS):
+            return 2
+        if news:
+            return 4  # named injury, severity unclear from the text -- medium default
+        return 2  # ruled out with no news text at all -- assume short
+
+    def _availability(self, element, gw_offset=0):
+        """Return this player's probability-of-playing multiplier for a
+        gameweek `gw_offset` steps beyond the next one (0 = the very next
+        gameweek, which is what chance_of_playing_next_round describes).
+
+        Beyond gw_offset 0 there's no live per-gameweek signal from the FPL
+        API. Previously project_horizon reused this same number for every
+        future gameweek, so a 2-week knock and a season-ending injury looked
+        identical 8 gameweeks into a Wildcard scan. Instead, once a player is
+        fully ruled out at gw_offset 0, ramp their availability back toward
+        fit over an estimated recovery window rather than holding them at
+        zero for the whole horizon.
+        """
+        chance = element.get("chance_of_playing_next_round")
+
+        # A player flagged injured/suspended/unavailable is ruled out even if
+        # chance_of_playing_next_round hasn't caught up to 0 yet -- the status
+        # field is the more reliable signal for "definitely not playing", and
+        # it can lag or sit on a stale nonzero number, not just null. Status
+        # wins outright here, whatever chance currently says.
+        if element.get("status") in ("i", "s", "u"):
+            chance = 0
+
+        availability = (chance / 100.0) if chance is not None else 1.0
+
+        if gw_offset <= 0 or availability > 0:
+            return availability
+
+        weeks_out = self._estimated_weeks_out(element)
+        if weeks_out >= 99:
+            return 0.0
+        return min(1.0, gw_offset / weeks_out)
+
+    def _risk_note(self, element):
+        """Short, human-readable explanation for why a player's projection
+        is suppressed or shaky, so the UI can show *why* -- not just a
+        lower number -- for injuries, suspensions, doubts, and players who
+        simply aren't a nailed starter (season-long starts_per_90 below
+        ROTATION_RISK_STARTS_P90). Returns None when there's nothing to flag."""
+        status = element.get("status")
+        chance = element.get("chance_of_playing_next_round")
+        news = (element.get("news") or "").strip()
+
+        if status == "u":
+            return "unavailable"
+        if status == "s":
+            return "suspended" + (f" ({news})" if news else "")
+        if status == "i":
+            weeks = self._estimated_weeks_out(element)
+            eta = "~1 more GW" if weeks <= 2 else f"~{weeks} more GWs (estimate)"
+            return f"injured, {eta}" + (f" — {news}" if news else "")
+        if chance is not None and chance < 100:
+            return f"{chance}% chance of playing" + (f" — {news}" if news else "")
+
+        starts_p90 = element.get("starts_per_90") or 0.0
+        minutes = element.get("minutes") or 0
+        if minutes >= 90 and 0 < starts_p90 < ROTATION_RISK_STARTS_P90:
+            return "rotation risk (fringe starter)"
+
+        return None
+
+    def _player_gw_xp(self, element, gw, gw_offset=0):
+        """Return (xp, n_fixtures) for this player in this single gameweek.
+        gw_offset is how many gameweeks beyond the next one this call is
+        for (0 for a direct single-gameweek projection); it only affects
+        the injury/suspension recovery ramp in _availability()."""
         position = POSITION_MAP.get(element.get("element_type"))
         if position is None:
             return 0.0, 0
@@ -192,12 +284,14 @@ class XPModel:
         if not team_fixtures:
             return 0.0, 0
 
+        availability = self._availability(element, gw_offset)
+
         total = 0.0
         for fixture, is_home in team_fixtures:
             opponent_id = fixture.get("team_a") if is_home else fixture.get("team_h")
             opponent_strength = self._opponent_strength(opponent_id, opponent_is_home=not is_home)
             fixture_multiplier = self.league_avg_strength / opponent_strength if opponent_strength else 1.0
-            total += self._fixture_points(element, position, fixture_multiplier, self.scoring)
+            total += self._fixture_points(element, position, fixture_multiplier, self.scoring, availability)
 
         return total, len(team_fixtures)
 
@@ -208,7 +302,7 @@ class XPModel:
         for element in self.bootstrap.get("elements", []):
             if not element.get("can_select", True):
                 continue
-            xp, n_fixtures = self._player_gw_xp(element, gw)
+            xp, n_fixtures = self._player_gw_xp(element, gw, gw_offset=0)
             position = POSITION_MAP.get(element.get("element_type"))
             team = self.teams_by_id.get(element.get("team"), {})
             results.append({
@@ -220,6 +314,7 @@ class XPModel:
                 "cost": (element.get("now_cost") or 0) / 10.0,
                 "xp": round(xp, 2),
                 "fixtures_this_gw": n_fixtures,
+                "risk_note": self._risk_note(element),
             })
         return results
 
@@ -246,15 +341,16 @@ class XPModel:
             gw = start_gw + i
             weight = decay ** i
             for pid, row in by_id.items():
-                xp, n_fixtures = self._player_gw_xp(row["_element"], gw)
+                xp, n_fixtures = self._player_gw_xp(row["_element"], gw, gw_offset=i)
                 row["xp"] += xp * weight
                 row["fixtures_this_gw"] += n_fixtures
 
         out = []
         for row in by_id.values():
             row = dict(row)
-            row.pop("_element")
+            element = row.pop("_element")
             row["xp"] = round(row["xp"], 2)
+            row["risk_note"] = self._risk_note(element)
             out.append(row)
         return out
 
