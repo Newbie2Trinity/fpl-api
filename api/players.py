@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from _lib import fetch_fpl_data, XPModel, send_json, send_cors_preflight
+from _lib import fetch_fpl_data, get_history_cache, XPModel, send_json, send_cors_preflight
 
 
 class handler(BaseHTTPRequestHandler):
@@ -18,7 +18,8 @@ class handler(BaseHTTPRequestHandler):
             horizon = int(query.get("horizon", [1])[0])
 
             bootstrap, fixtures = fetch_fpl_data()
-            model = XPModel(bootstrap, fixtures)
+            history_cache = get_history_cache()
+            model = XPModel(bootstrap, fixtures, history_cache=history_cache)
 
             if horizon <= 1:
                 players = model.project_gameweek(gameweek)

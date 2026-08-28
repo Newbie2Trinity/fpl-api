@@ -3,7 +3,7 @@ import sys
 from http.server import BaseHTTPRequestHandler
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from _lib import fetch_fpl_data, XPModel, best_xi_from_squad, read_json_body, send_json, send_cors_preflight
+from _lib import fetch_fpl_data, get_history_cache, XPModel, best_xi_from_squad, read_json_body, send_json, send_cors_preflight
 
 
 class handler(BaseHTTPRequestHandler):
@@ -27,7 +27,8 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             bootstrap, fixtures = fetch_fpl_data()
-            model = XPModel(bootstrap, fixtures)
+            history_cache = get_history_cache()
+            model = XPModel(bootstrap, fixtures, history_cache=history_cache)
 
             if horizon <= 1:
                 players = model.project_gameweek(gameweek)

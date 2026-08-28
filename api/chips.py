@@ -3,7 +3,7 @@ import sys
 from http.server import BaseHTTPRequestHandler
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from _lib import fetch_fpl_data, XPModel, analyze_chip_windows, read_json_body, send_json, send_cors_preflight
+from _lib import fetch_fpl_data, get_history_cache, XPModel, analyze_chip_windows, read_json_body, send_json, send_cors_preflight
 
 
 class handler(BaseHTTPRequestHandler):
@@ -20,7 +20,8 @@ class handler(BaseHTTPRequestHandler):
             chips_used = body.get("chips_used") or []
 
             bootstrap, fixtures = fetch_fpl_data()
-            model = XPModel(bootstrap, fixtures)
+            history_cache = get_history_cache()
+            model = XPModel(bootstrap, fixtures, history_cache=history_cache)
 
             result = analyze_chip_windows(
                 model,

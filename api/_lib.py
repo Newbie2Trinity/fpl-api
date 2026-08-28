@@ -11,12 +11,15 @@ import math
 import os
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 
 FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
+FPL_ELEMENT_SUMMARY_URL = "https://fantasy.premierleague.com/api/element-summary/{}/"
 
 POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
@@ -37,6 +40,32 @@ SHORT_TERM_NEWS_KEYWORDS = (
 )
 ROTATION_RISK_STARTS_P90 = 0.5  # below this, flag as a fringe starter
 
+# starts_per_90 is a season-to-date rate: it's 0.0 for EVERY player before
+# a ball's been kicked (or briefly, after a long injury lay-off), which
+# means a third-choice keeper looks statistically identical to the club's
+# undisputed #1 -- both show 0 starts. Two fallback signals fill that gap,
+# preferred in this order (see XPModel._preseason_prior()):
+#   1. Last season's actual game-time % (player_history_cache, populated by
+#      refresh_history_cache() below) -- real playing-time evidence, when
+#      the player has Premier League history to draw on.
+#   2. selected_by_percent (ownership) relative to the most-owned player at
+#      the same club/position -- the market's live read on who's likely to
+#      start, for anyone with no last-season history (new signings,
+#      promoted-club debutants).
+PRESEASON_NAILED_STARTS_P90 = 0.85  # assumed starts_per_90 for a club's clear #1 at a position, pre-data
+TRUST_GAMES = 3  # real gameweeks played league-wide before starts_per_90 fully overrides both priors above
+MIN_PEER_OWNERSHIP = 2.0  # below this, nobody at the club/position is meaningfully owned -- treat as no signal
+LAST_SEASON_MINUTES_DENOM = 3420  # 38 games x 90 mins -- last_season_game_time_pct's denominator
+REFRESH_CONCURRENCY = 30  # concurrent element-summary fetches in refresh_history_cache()
+ELEMENT_SUMMARY_TIMEOUT = 8  # seconds -- keep short so one slow player can't stall the whole refresh
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -48,9 +77,9 @@ CORS_HEADERS = {
 # Fetching live FPL data
 # ----------------------------------------------------------------------
 
-def _http_get_json(url, headers=None):
+def _http_get_json(url, headers=None, timeout=25):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=25) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -60,6 +89,63 @@ def fetch_fpl_data():
     bootstrap = _http_get_json(FPL_BOOTSTRAP_URL, headers=headers)
     fixtures = _http_get_json(FPL_FIXTURES_URL, headers=headers)
     return bootstrap, fixtures
+
+
+def fetch_player_last_season_minutes(player_id):
+    """Most recent past-season's total minutes for one player, from FPL's
+    per-player summary endpoint, or None if they have no Premier League/FPL
+    history at all (new signing, promoted-club debutant, first season)."""
+    headers = {"User-Agent": "Mozilla/5.0 (fpl-companion)"}
+    data = _http_get_json(
+        FPL_ELEMENT_SUMMARY_URL.format(player_id), headers=headers, timeout=ELEMENT_SUMMARY_TIMEOUT
+    )
+    history_past = data.get("history_past") or []
+    if not history_past:
+        return None
+    return history_past[-1].get("minutes")
+
+
+def refresh_history_cache(bootstrap):
+    """Populate player_history_cache with every selectable player's last-
+    season game-time %, used as the model's preseason 'will they actually
+    start' prior (see PRESEASON_NAILED_STARTS_P90 above). FPL has no bulk
+    endpoint for this -- it's one HTTP call per player (element-summary),
+    so this fetches them concurrently rather than in a loop; ~650 players
+    serially would be far too slow for a single request. Meant to be called
+    occasionally (e.g. a weekly cron), not on every page load -- the
+    ordinary API endpoints just read whatever's already cached via
+    get_history_cache().
+    """
+    player_ids = [e["id"] for e in bootstrap.get("elements", []) if e.get("can_select", True)]
+
+    def fetch_one(player_id):
+        try:
+            minutes = fetch_player_last_season_minutes(player_id)
+        except Exception:
+            # One player's summary call failing (timeout, transient FPL
+            # error) shouldn't sink the whole refresh -- they just don't
+            # get cached this round and fall back to the ownership prior.
+            minutes = None
+        return player_id, minutes
+
+    rows = []
+    now = datetime.now(timezone.utc).isoformat()
+    with ThreadPoolExecutor(max_workers=REFRESH_CONCURRENCY) as pool:
+        futures = [pool.submit(fetch_one, pid) for pid in player_ids]
+        for future in as_completed(futures):
+            player_id, minutes = future.result()
+            if minutes is None:
+                continue
+            pct = min(minutes / LAST_SEASON_MINUTES_DENOM, 1.0)
+            rows.append({
+                "player_id": player_id,
+                "last_season_minutes": minutes,
+                "last_season_game_time_pct": round(pct, 4),
+                "updated_at": now,
+            })
+
+    save_history_cache_rows(rows)
+    return {"players_checked": len(player_ids), "players_cached": len(rows)}
 
 
 # ----------------------------------------------------------------------
@@ -86,11 +172,15 @@ def _poisson_sf_at_least(lam, threshold):
 # ----------------------------------------------------------------------
 
 class XPModel:
-    def __init__(self, bootstrap, fixtures):
+    def __init__(self, bootstrap, fixtures, history_cache=None):
         self.bootstrap = bootstrap
         self.fixtures = fixtures
         self.scoring = bootstrap.get("game_config", {}).get("scoring", {})
         self.teams_by_id = {t["id"]: t for t in bootstrap.get("teams", [])}
+        # {player_id: last_season_game_time_pct}, from get_history_cache() --
+        # see _preseason_prior(). Optional: an empty/missing cache just means
+        # every player falls back to the ownership-based prior.
+        self._history_cache = history_cache or {}
 
         strengths = []
         for t in bootstrap.get("teams", []):
@@ -107,6 +197,36 @@ class XPModel:
             if gw is None:
                 continue
             self._fixtures_by_gw.setdefault(gw, []).append(f)
+
+        # (team_id, position) -> highest selected_by_percent among that
+        # club's selectable players at that position. Used by _nailed_prior()
+        # below to guess who's actually first-choice before real playing-time
+        # data exists to prove it -- see the big comment there.
+        self._max_ownership_by_team_pos = {}
+        for element in bootstrap.get("elements", []):
+            if not element.get("can_select", True):
+                continue
+            position = POSITION_MAP.get(element.get("element_type"))
+            if position is None:
+                continue
+            ownership = _safe_float(element.get("selected_by_percent"))
+            key = (element.get("team"), position)
+            if ownership > self._max_ownership_by_team_pos.get(key, 0.0):
+                self._max_ownership_by_team_pos[key] = ownership
+
+        # How much to trust real minutes/starts data over the ownership-based
+        # prior, based on how many real Premier League gameweeks have been
+        # played SO FAR THIS SEASON -- not this player's own minutes. Using
+        # the player's own minutes as the trust signal (the previous version
+        # of this) can never recover for a player who's genuinely never
+        # picked: their own minutes stay 0 forever, so trust never rises and
+        # the model would lean on the ownership prior indefinitely even once
+        # real matches have conclusively shown they don't play. Basing trust
+        # on games played league-wide fixes that: after TRUST_GAMES real
+        # gameweeks, a 0-minute "available" player's own starts_per_90 (also
+        # 0) is fully trusted on its own -- actual pitch time, not ownership.
+        games_played = sum(1 for e in bootstrap.get("events", []) if e.get("finished"))
+        self.data_trust = min(games_played / TRUST_GAMES, 1.0)
 
     # -- internal helpers -------------------------------------------------
 
@@ -125,12 +245,49 @@ class XPModel:
                 out.append((f, False))
         return out
 
+    def _nailed_prior(self, element):
+        """Rough 0-1 read on 'is this player actually first-choice at their
+        position for their club', from selected_by_percent relative to the
+        most-owned player in the same (team, position) group. Only meant to
+        fill the gap starts_per_90 leaves at the start of a season (or
+        after a long injury) -- see the module-level comment above
+        PRESEASON_NAILED_STARTS_P90."""
+        position = POSITION_MAP.get(element.get("element_type"))
+        ownership = _safe_float(element.get("selected_by_percent"))
+        peer_max = self._max_ownership_by_team_pos.get((element.get("team"), position), 0.0)
+        if peer_max < MIN_PEER_OWNERSHIP:
+            # Nobody at this club/position is meaningfully owned yet (e.g. a
+            # promoted side nobody's looked at) -- no real signal either way,
+            # so don't suppress anyone off the back of noise.
+            return 1.0
+        return min(ownership / peer_max, 1.0)
+
+    def _preseason_prior(self, element):
+        """Best available 0-1 read on 'will this player actually start',
+        for filling the gap starts_per_90 leaves before real current-season
+        data exists. Prefers last season's actual game-time % (real
+        evidence) when it's cached for this player; falls back to the
+        ownership-based comparison (_nailed_prior) for anyone without
+        last-season top-flight history."""
+        cached_pct = self._history_cache.get(element.get("id"))
+        if cached_pct is not None:
+            return cached_pct
+        return self._nailed_prior(element)
+
     def _fixture_points(self, element, position, fixture_multiplier, scoring, availability):
         """Sum of xP components a-h for a single fixture. `availability` is
         this player's probability-of-playing multiplier for the gameweek in
         question -- see _availability() for how it's derived (including the
         horizon recovery ramp for players currently ruled out)."""
-        starts_p90 = min(element.get("starts_per_90") or 0.0, 1.0)
+        starts_p90_real = min(element.get("starts_per_90") or 0.0, 1.0)
+        # Blend real season starts data with the ownership-based prior,
+        # trusting real data more as actual gameweeks are played (see
+        # self.data_trust in __init__) -- so this only matters early in the
+        # season and quietly gets out of the way once starts_per_90 reflects
+        # real playing time.
+        prior_starts_p90 = self._preseason_prior(element) * PRESEASON_NAILED_STARTS_P90
+        starts_p90 = self.data_trust * starts_p90_real + (1 - self.data_trust) * prior_starts_p90
+
         p_60 = availability * starts_p90
         p_any = availability * min(starts_p90 + 0.15, 1.0)
 
@@ -263,9 +420,24 @@ class XPModel:
         if chance is not None and chance < 100:
             return f"{chance}% chance of playing" + (f" — {news}" if news else "")
 
-        starts_p90 = element.get("starts_per_90") or 0.0
+        starts_p90_real = element.get("starts_per_90") or 0.0
         minutes = element.get("minutes") or 0
-        if minutes >= 90 and 0 < starts_p90 < ROTATION_RISK_STARTS_P90:
+
+        if self.data_trust < 1.0:
+            # Not enough real gameweeks played yet to trust starts_per_90 on
+            # its own -- fall back to last season's game-time % (or, absent
+            # that, ownership), but real evidence (even partial) that this
+            # player DOES start beats a merely-low prior, so a breakout
+            # player the data hasn't caught up to yet doesn't get wrongly
+            # flagged.
+            nailed = self._preseason_prior(element)
+            if nailed < ROTATION_RISK_STARTS_P90 and starts_p90_real < ROTATION_RISK_STARTS_P90:
+                if minutes == 0:
+                    return "hasn't played for their club yet this season -- projected as a likely non-starter"
+                return "limited minutes for their club so far this season -- projected as a likely non-starter"
+        elif minutes == 0:
+            return "hasn't featured for their club this season"
+        elif 0 < starts_p90_real < ROTATION_RISK_STARTS_P90:
             return "rotation risk (fringe starter)"
 
         return None
@@ -975,6 +1147,56 @@ def save_squad(payload):
     with urllib.request.urlopen(req, timeout=15) as resp:
         rows = json.loads(resp.read().decode("utf-8"))
     return rows[0] if rows else body
+
+
+def get_history_cache():
+    """Return {player_id: last_season_game_time_pct} from the
+    player_history_cache table (see refresh_history_cache()). Treated as
+    optional everywhere it's used: if Supabase isn't configured, the table
+    doesn't exist yet, or the request fails, this returns {} rather than
+    raising -- an ordinary Optimize/Transfer request shouldn't break just
+    because this enhancement isn't set up or Supabase hiccups."""
+    url, key = _supabase_config()
+    if not url or not key:
+        return {}
+
+    endpoint = f"{url}/rest/v1/player_history_cache?select=player_id,last_season_game_time_pct"
+    req = urllib.request.Request(endpoint, headers={
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return {}
+    return {r["player_id"]: r["last_season_game_time_pct"] for r in rows}
+
+
+def save_history_cache_rows(rows):
+    """Bulk upsert into player_history_cache -- one request for the whole
+    batch (PostgREST supports an array body), not one write per player."""
+    url, key = _supabase_config()
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY not configured")
+    if not rows:
+        return
+
+    endpoint = f"{url}/rest/v1/player_history_cache?on_conflict=player_id"
+    data = json.dumps(rows).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=data,
+        method="POST",
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        resp.read()
 
 
 # ----------------------------------------------------------------------
