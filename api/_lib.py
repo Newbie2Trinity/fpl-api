@@ -9,6 +9,7 @@ dependencies are numpy/scipy for the MILP squad optimizer.
 import json
 import math
 import os
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +59,57 @@ MIN_PEER_OWNERSHIP = 2.0  # below this, nobody at the club/position is meaningfu
 LAST_SEASON_MINUTES_DENOM = 3420  # 38 games x 90 mins -- last_season_game_time_pct's denominator
 REFRESH_CONCURRENCY = 30  # concurrent element-summary fetches in refresh_history_cache()
 ELEMENT_SUMMARY_TIMEOUT = 8  # seconds -- keep short so one slow player can't stall the whole refresh
+
+# The three clubs promoted into this season's Premier League have no FPL
+# history at all -- player_history_cache above only covers players who had
+# top-flight minutes last season, so every promoted-club player would
+# otherwise drop straight to the ownership-based guess (_nailed_prior),
+# which is a weak signal for a club nobody's picked yet. This is a third,
+# middle tier: last season's Championship game-time %, hand-compiled from
+# Wikipedia's 2025-26 season pages (no free source gave scrapable per-player
+# data -- FBref/ESPN/WhoScored/FotMob are all JS-rendered with nothing in
+# the static HTML, FBref blocks automated fetches outright, and Coventry's
+# own Wikipedia page has no player-appearances table at all, unlike Hull's
+# and Ipswich's). Values are starts+subs converted to an estimated % of a
+# 46-game Championship season's available minutes (start = 90 mins, sub
+# appearance = 25 mins, /4140), not exact minutes -- good enough to tell a
+# nailed starter from a fringe player, which is all this tier is for.
+# Keyed by this season's FPL team id -> normalized surname -> 0-1 pct.
+# Coventry (team 7) has no entries -- see above -- so its players fall
+# through to _nailed_prior same as before this feature existed.
+CHAMPIONSHIP_2025_26_GAME_TIME = {
+    7: {},  # Coventry City -- no scrapable source found, see comment above
+    11: {  # Hull City
+        "pandur": 0.74, "phillips": 0.0,
+        "coyle": 0.60, "giles": 0.59, "hughes": 0.66, "ajayi": 0.21,
+        "egan": 0.64, "jacob": 0.05, "drameh": 0.23, "famewo": 0.19,
+        "mcnair": 0.06,
+        "lundstram": 0.28, "hadziahmetovic": 0.52, "gyabi": 0.21,
+        "crooks": 0.41, "slater": 0.66, "collyer": 0.01, "palmer": 0.10,
+        "millar": 0.30, "mcburnie": 0.48, "belloumi": 0.15, "akintola": 0.20,
+        "gelhardt": 0.54, "joseph": 0.57, "dowell": 0.06, "koumas": 0.05,
+        "destan": 0.17,
+    },
+    12: {  # Ipswich Town
+        "walton": 0.77, "palmer": 0.22,
+        "oshea": 0.98, "davis": 0.75, "greaves": 0.48, "furlong": 0.85,
+        "kipre": 0.65, "johnson": 0.24, "young": 0.13,
+        "matusiwa": 0.96, "taylor": 0.59, "cajuste": 0.39, "burns": 0.23,
+        "neil": 0.22, "nunez": 0.57,
+        "clarke": 0.63, "hirst": 0.61, "philogene": 0.55, "azon": 0.54,
+        "mcateer": 0.38, "egeli": 0.45, "akpom": 0.29,
+    },
+}
+
+
+def _normalize_surname(name):
+    """Lowercase, accent/punctuation-stripped surname for matching against
+    the hand-compiled CHAMPIONSHIP_2025_26_GAME_TIME table above -- FPL's
+    API and Wikipedia don't always agree on exact accent characters or
+    apostrophes (e.g. Nunez vs Núñez, O'Shea vs OShea), so comparing on
+    letters-only ASCII avoids silent misses."""
+    stripped = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii")
+    return "".join(ch for ch in stripped.lower() if ch.isalpha() or ch == " ").strip()
 
 
 def _safe_float(value, default=0.0):
@@ -262,16 +314,36 @@ class XPModel:
             return 1.0
         return min(ownership / peer_max, 1.0)
 
+    def _promoted_club_prior(self, element):
+        """Second tier: last season's Championship game-time % for the
+        three promoted clubs (CHAMPIONSHIP_2025_26_GAME_TIME), for players
+        who have no FPL/top-flight history but DO have real evidence from
+        the division below -- still real playing-time evidence, just not
+        from the Premier League. Returns None (not 0) when there's no entry,
+        so callers know to fall through to the ownership-based guess rather
+        than treating "no data" as "never plays"."""
+        club_table = CHAMPIONSHIP_2025_26_GAME_TIME.get(element.get("team"))
+        if not club_table:
+            return None
+        surname = _normalize_surname(element.get("second_name"))
+        return club_table.get(surname)
+
     def _preseason_prior(self, element):
         """Best available 0-1 read on 'will this player actually start',
         for filling the gap starts_per_90 leaves before real current-season
-        data exists. Prefers last season's actual game-time % (real
-        evidence) when it's cached for this player; falls back to the
-        ownership-based comparison (_nailed_prior) for anyone without
-        last-season top-flight history."""
+        data exists. Preferred in order: (1) last season's actual top-flight
+        game-time % when cached for this player, (2) last season's
+        Championship game-time % for promoted-club players
+        (_promoted_club_prior), (3) the ownership-based comparison
+        (_nailed_prior) for anyone with no real playing-time history at all
+        (new signings, and Coventry -- see the comment on
+        CHAMPIONSHIP_2025_26_GAME_TIME)."""
         cached_pct = self._history_cache.get(element.get("id"))
         if cached_pct is not None:
             return cached_pct
+        promoted_pct = self._promoted_club_prior(element)
+        if promoted_pct is not None:
+            return promoted_pct
         return self._nailed_prior(element)
 
     def _fixture_points(self, element, position, fixture_multiplier, scoring, availability):
