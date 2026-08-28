@@ -2,6 +2,15 @@
   "functions": {
     "api/*.py": {
       "maxDuration": 30
+    },
+    "api/refresh_history_cache.py": {
+      "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/refresh_history_cache",
+      "schedule": "0 6 * * 1"
+    }
+  ]
 }
