@@ -1,9 +1,6 @@
 {
   "functions": {
     "api/*.py": {
-      "maxDuration": 30
-    },
-    "api/refresh_history_cache.py": {
       "maxDuration": 60
     }
   },
