@@ -21,6 +21,7 @@ from scipy.optimize import Bounds, LinearConstraint, milp
 FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 FPL_ELEMENT_SUMMARY_URL = "https://fantasy.premierleague.com/api/element-summary/{}/"
+FPL_ENTRY_PICKS_URL = "https://fantasy.premierleague.com/api/entry/{}/event/{}/picks/"
 
 POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
@@ -141,6 +142,39 @@ def fetch_fpl_data():
     bootstrap = _http_get_json(FPL_BOOTSTRAP_URL, headers=headers)
     fixtures = _http_get_json(FPL_FIXTURES_URL, headers=headers)
     return bootstrap, fixtures
+
+
+def current_gameweek(bootstrap):
+    """Best-guess 'right now' gameweek from bootstrap's events list: the
+    live/just-finished one if there is one, else the next upcoming deadline.
+    Used by import_team.py as the default gameweek to pull picks for when
+    the caller doesn't specify one."""
+    events = bootstrap.get("events", [])
+    current = next((e for e in events if e.get("is_current")), None)
+    if current:
+        return current.get("id")
+    nxt = next((e for e in events if e.get("is_next")), None)
+    return nxt.get("id") if nxt else None
+
+
+def fetch_entry_picks(entry_id, gameweek):
+    """One FPL manager's squad picks for one gameweek, from FPL's public
+    entry endpoint -- this is the same data anyone can see on that entry's
+    public 'Points' page, no login needed. Used by import_team.py to pull a
+    real, currently-live squad in as this app's saved squad, since until now
+    the only way to populate a saved squad here was to run it through this
+    app's own optimizer first."""
+    headers = {"User-Agent": "Mozilla/5.0 (fpl-companion)"}
+    url = FPL_ENTRY_PICKS_URL.format(entry_id, gameweek)
+    try:
+        return _http_get_json(url, headers=headers, timeout=15)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError(
+                f"No picks found for FPL team {entry_id}, gameweek {gameweek} -- "
+                "double check the team ID and that this gameweek's picks are set"
+            )
+        raise
 
 
 def fetch_player_last_season_minutes(player_id):
